@@ -63,9 +63,10 @@ async function transcribe(){
     setStatus('Uploading...');
     const res = await fetch('/api/transcribe', { method: 'POST', body: form });
     if (!res.ok){
-      const t = await res.json().catch(()=>null);
-      const msg = t?.error || (await res.text().catch(()=>res.statusText));
-      setStatus('Error: ' + res.status + ' — ' + msg);
+      // Try parse JSON error body, fallback to text
+      const errJson = await res.json().catch(()=>null);
+      const txt = errJson?.error || errJson?.detail || (await res.text().catch(()=>res.statusText));
+      setStatus('Error: ' + res.status + ' — ' + txt);
       return;
     }
 
