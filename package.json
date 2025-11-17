@@ -1,5 +1,12 @@
-"dependencies": {
-  "busboy": "^1.6.0",
-  "form-data": "^4.0.0",
-  "node-fetch": "^2.6.7"
+{
+  "name": "insta-reel-transcriber",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.6.7"
+  }
 }
