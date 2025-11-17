@@ -6,10 +6,10 @@ let fetchLib = global.fetch;
 try {
   if (!fetchLib) fetchLib = require('node-fetch');
 } catch (e) {
-  // node-fetch may not be installed locally; Vercel often provides fetch in runtime
+  // node-fetch might not be installed locally; Vercel provides fetch in many runtimes
 }
 
-const MAX_BYTES = 25 * 1024 * 1024; // 25 MB limit
+const MAX_BYTES = 25 * 1024 * 1024; // 25 MB
 
 module.exports = async (req, res) => {
   try {
@@ -30,7 +30,7 @@ module.exports = async (req, res) => {
       let aborted = false;
       busboy.on('file', (fieldname, fileStream, info) => {
         const chunks = [];
-        uploadedFilename = info && info.filename ? info.filename : uploadedFilename;
+        uploadedFilename = (info && info.filename) ? info.filename : uploadedFilename;
         fileStream.on('data', (d) => chunks.push(d));
         fileStream.on('limit', () => {
           aborted = true;
@@ -69,4 +69,57 @@ module.exports = async (req, res) => {
         if (jsonMatch) {
           try {
             const jsData = JSON.parse(jsonMatch[1]);
-            const media = jsData?.entry_data?.PostPage?.[0]?._
+            const media = jsData?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+            if (media && media.video_url) videoUrl = media.video_url;
+          } catch (e) {
+            console.warn('Could not parse _sharedData JSON:', e.message);
+          }
+        }
+      }
+
+      if (!videoUrl) {
+        console.error('Could not find og:video or video_url in Instagram page');
+        return res.status(400).json({ error: 'Cannot find direct video URL. Make sure reel is public or upload MP4.' });
+      }
+
+      const vresp = await fetchLib(videoUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!vresp.ok) {
+        console.error('Failed to download video URL', videoUrl, vresp.status);
+        return res.status(502).json({ error: 'Failed to download video from Instagram' });
+      }
+      const arr = await vresp.arrayBuffer();
+      if (arr.byteLength > MAX_BYTES) {
+        return res.status(400).json({ error: 'Downloaded media exceeds size limit' });
+      }
+      mediaBuffer = Buffer.from(arr);
+      uploadedFilename = 'reel.mp4';
+    }
+
+    if (!mediaBuffer) return res.status(400).json({ error: 'No media provided — upload a file or provide insta_url' });
+
+    const form = new FormData();
+    form.append('file', mediaBuffer, { filename: uploadedFilename });
+    form.append('model', 'whisper-1');
+    form.append('translate', 'true'); // request translation to English
+    form.append('language', 'hi');
+
+    const openaiResp = await fetchLib('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+      body: form
+    });
+
+    if (!openaiResp.ok) {
+      const bodyText = await openaiResp.text().catch(() => '');
+      console.error('OpenAI transcription failed:', openaiResp.status, bodyText);
+      return res.status(502).json({ error: 'Transcription provider error', status: openaiResp.status, body: bodyText });
+    }
+
+    const j = await openaiResp.json();
+    const transcript = j.text || j.transcript || JSON.stringify(j);
+    return res.json({ transcript });
+  } catch (err) {
+    console.error('Unhandled error in transcribe function:', err && err.stack ? err.stack : String(err));
+    return res.status(500).json({ error: 'Internal server error', detail: String(err.message || err) });
+  }
+};
