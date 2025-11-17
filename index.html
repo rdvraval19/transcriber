@@ -1,0 +1,246 @@
+<!--
+Minimal Instagram Reel Transcriber
+Files included below:
+- index.html      (Static frontend)
+- api/transcribe.js (Vercel serverless function for downloading video, extracting audio and sending to OpenAI Whisper)
+- vercel.json     (simple config)
+
+Notes:
+- The frontend accepts a public Instagram reel URL OR a direct MP4 file upload.
+- The server tries to parse the Instagram page for the og:video meta tag to get the direct MP4 URL (works for public reels).
+- The server downloads the media, forwards it to OpenAI Speech-to-Text (Whisper) with translation requested (Hindi -> English). Set OPENAI_API_KEY in Vercel.
+- This is minimal, written for clarity, not production security.
+-->
+
+<!-- INDEX: index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Insta Reel Transcriber (Hindi → English)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;margin:24px}
+    .card{max-width:760px;margin:0 auto;padding:18px;border:1px solid #eee;border-radius:8px}
+    input,button,textarea{font-size:14px;padding:8px;border-radius:6px;border:1px solid #ccc;width:100%;box-sizing:border-box}
+    .row{display:flex;gap:8px}
+    .muted{color:#666;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Instagram Reel → English Transcript (Hindi audio)</h2>
+    <p class="muted">Paste a public Instagram reel link or upload the MP4. The app will try to auto-download the reel and transcribe/translate to English.</p>
+
+    <label>Instagram Reel URL</label>
+    <input id="url" placeholder="https://www.instagram.com/reel/XXXXXXXX/" />
+
+    <div style="height:8px"></div>
+    <label>Or upload MP4</label>
+    <input id="file" type="file" accept="video/*,audio/*" />
+
+    <div style="height:8px"></div>
+    <div class="row">
+      <button id="transcribe">Transcribe</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+
+    <div style="height:12px"></div>
+    <div id="status" class="muted">Idle</div>
+
+    <div style="height:12px"></div>
+    <label>Transcript (English)</label>
+    <textarea id="out" rows="10" readonly placeholder="Transcript will appear here..."></textarea>
+  </div>
+
+<script>
+const statusEl = document.getElementById('status');
+const outEl = document.getElementById('out');
+const urlEl = document.getElementById('url');
+const fileEl = document.getElementById('file');
+
+function setStatus(t){ statusEl.textContent = t }
+
+async function transcribe(){
+  setStatus('Preparing...');
+  outEl.value = '';
+
+  const form = new FormData();
+  const url = urlEl.value.trim();
+  if (url) form.append('insta_url', url);
+  if (fileEl.files && fileEl.files.length) form.append('file', fileEl.files[0]);
+  if (!url && !(fileEl.files && fileEl.files.length)){
+    setStatus('Please provide an Instagram reel URL or upload a file.');
+    return;
+  }
+
+  try{
+    setStatus('Uploading...');
+    const res = await fetch('/api/transcribe', { method: 'POST', body: form });
+    if (!res.ok){
+      const txt = await res.text();
+      setStatus('Error: ' + res.status + ' — ' + txt);
+      return;
+    }
+
+    setStatus('Transcribing...');
+    // Server streams JSON response (final transcript) — if small, just read text
+    const data = await res.json();
+    if (data.error){ setStatus('Error: ' + data.error); return }
+    outEl.value = data.transcript ?? data.text ?? JSON.stringify(data, null, 2);
+    setStatus('Done');
+  }catch(err){
+    console.error(err);
+    setStatus('Network or server error — check console');
+  }
+}
+
+document.getElementById('transcribe').addEventListener('click', ()=>{
+  transcribe();
+});
+
+document.getElementById('clear').addEventListener('click', ()=>{
+  urlEl.value=''; fileEl.value=''; outEl.value=''; setStatus('Idle');
+});
+</script>
+
+<!-- SERVERLESS: api/transcribe.js
+This is a Node.js Vercel serverless function. Place under /api/transcribe.js when deploying.
+It expects an OPENAI_API_KEY environment variable.
+Install dependencies in your project (package.json) for local testing: node-fetch, busboy
+-->
+
+
+<!--
+api/transcribe.js
+----------------
+Copy this file into /api/transcribe.js on Vercel.
+-->
+
+<script type="text/plain" id="api-transcribe">
+// Node.js serverless function (CommonJS style)
+// NOTE: Vercel serverless environment: use `fetch` available there. If not, add node-fetch.
+
+const {Readable} = require('stream');
+const fetch = require('node-fetch');
+const Busboy = require('busboy');
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
+
+  try{
+    // parse form-data
+    const busboy = new Busboy({ headers: req.headers });
+    let uploadedBuffer = null;
+    let filename = '';
+    let insta_url = '';
+
+    await new Promise((resolve, reject) => {
+      busboy.on('file', (fieldname, file, fn, info) => {
+        filename = info.filename || 'upload';
+        const chunks = [];
+        file.on('data', (d) => chunks.push(d));
+        file.on('end', () => {
+          uploadedBuffer = Buffer.concat(chunks);
+        });
+      });
+
+      busboy.on('field', (name, val) => {
+        if (name === 'insta_url') insta_url = val;
+      });
+
+      busboy.on('finish', resolve);
+      busboy.on('error', reject);
+
+      req.pipe(busboy);
+    });
+
+    // If insta_url provided and no file, try to fetch direct video URL from the page
+    let mediaBuffer = uploadedBuffer;
+    if (!mediaBuffer && insta_url){
+      // fetch the page
+      const pageResp = await fetch(insta_url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const html = await pageResp.text();
+
+      // try to find og:video meta or video url in JSON
+      const ogMatch = html.match(/<meta property="og:video" content="([^"]+)"/i);
+      let videoUrl = ogMatch ? ogMatch[1] : null;
+
+      if (!videoUrl){
+        // try JSONLD or window._sharedData approach
+        const jsonMatch = html.match(/window\._sharedData = (\{.*?\});</s);
+        if (jsonMatch){
+          try{
+            const data = JSON.parse(jsonMatch[1]);
+            // try to dig for display_url or video_url (best-effort)
+            const media = data.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+            if (media && media.video_url) videoUrl = media.video_url;
+          }catch(e){/* ignore parse errors */}
+        }
+      }
+
+      if (!videoUrl) return res.status(400).json({ error: 'Cannot find direct video URL on provided Instagram page. Make sure the reel is public.' });
+
+      // fetch video
+      const vresp = await fetch(videoUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!vresp.ok) return res.status(502).json({ error: 'Failed to download video from Instagram' });
+      mediaBuffer = Buffer.from(await vresp.arrayBuffer());
+      filename = 'reel.mp4';
+    }
+
+    if (!mediaBuffer) return res.status(400).json({ error: 'No media provided' });
+
+    // Now send to speech-to-text provider (OpenAI Whisper example)
+    const OPENAI_KEY = process.env.OPENAI_API_KEY;
+    if (!OPENAI_KEY) return res.status(500).json({ error: 'OPENAI_API_KEY not configured in environment' });
+
+    // Build multipart/form-data to OpenAI
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('file', mediaBuffer, { filename });
+    form.append('model', 'whisper-1');
+    // request translation to English from source language (Hindi): set translate=true if provider supports
+    form.append('translate', 'true');
+    // hint source language
+    form.append('language', 'hi');
+
+    const oresp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+      body: form
+    });
+
+    if (!oresp.ok){
+      const txt = await oresp.text();
+      return res.status(502).json({ error: 'Speech-to-text failed: ' + txt });
+    }
+
+    const json = await oresp.json();
+    // Json typically contains 'text' property
+    const transcript = json.text || json.transcript || JSON.stringify(json);
+
+    return res.json({ transcript });
+
+  } catch (err){
+    console.error(err);
+    return res.status(500).json({ error: String(err) });
+  }
+};
+</script>
+
+<!-- vercel.json
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/transcribe.js", "use": "@vercel/node" },
+    { "src": "index.html", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/transcribe", "dest": "/api/transcribe.js" },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
+}
+-->
+
+</body>
+</html>
